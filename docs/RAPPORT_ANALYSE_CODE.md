@@ -1,193 +1,230 @@
 # Rapport d'analyse du code — KadiPy
 
 **Projet :** KadiPy — « le pandas de l'agriculture africaine »
-**Version analysée :** 1.0.0 (branche `main`)
-**Date :** 17 juillet 2026
-**Périmètre :** ~11 800 lignes de Python (`kadi/`) + 238 tests unitaires
+**Version analysée :** 1.0.0
+**Date :** 12 août 2026
+**Périmètre :** ~11 800 lignes de Python (`kadi/`), 238 tests unitaires,
+3 workflows CI, analyse module par module.
 
 ---
 
 ## 1. Synthèse
 
-KadiPy est une bibliothèque Python mature et bien structurée, destinée à
-l'analyse de données agricoles au Bénin et en Afrique de l'Ouest. Le code
-est de **bonne qualité générale** : architecture claire en trois modules
-métier, documentation abondante (docstrings et notebooks), gestion
-d'erreurs soignée et une approche « offline-first » cohérente.
+KadiPy est une bibliothèque Python **mature, bien architecturée et bien
+testée** pour l'analyse de données agricoles au Bénin. L'architecture en
+trois modules (façades `WeatherSession`, `Market`, `DataPipeline`), la
+documentation abondante et la stratégie « offline-first » sont d'excellente
+facture. **Les 238 tests unitaires passent.**
 
-**Verdict global : solide, prêt pour la production sur son périmètre V1.**
-Les points d'amélioration relevés sont mineurs (dette technique légère,
-quelques incohérences de configuration), sans bug bloquant identifié.
+Cette seconde passe, plus approfondie, a examiné la logique métier ligne à
+ligne. Elle **ne révèle aucun bug bloquant**, mais met au jour un ensemble
+cohérent de **défauts de configuration et de modélisation** à corriger : une
+double source de vérité pour les taux de change, plusieurs clés de
+configuration mortes, un facteur de consommation carburant ignoré, et une
+hypothèse implicite de données journalières dans le modèle de prévision.
 
 | Critère | Évaluation |
 |---|---|
-| Architecture | ★★★★★ Excellente séparation des responsabilités |
-| Lisibilité / documentation | ★★★★★ Docstrings complètes, code commenté en français |
-| Tests | ★★★★☆ 238 tests passent ; couverture d'intégration réseau à confirmer |
-| Gestion d'erreurs | ★★★★☆ Hiérarchie d'exceptions dédiée, fallbacks robustes |
-| Cohérence configuration | ★★★☆☆ Quelques doublons / config morte |
-| Sécurité | ★★★★★ Aucune fuite de secret, pas de code dangereux |
+| Architecture | ★★★★★ Séparation des responsabilités exemplaire |
+| Lisibilité / documentation | ★★★★★ Docstrings complètes, code commenté |
+| Tests | ★★★★☆ 238 tests OK ; intégration réseau non couverte hors ligne |
+| Gestion d'erreurs | ★★★★☆ Hiérarchie dédiée, fallbacks robustes |
+| Cohérence config / modélisation | ★★★☆☆ Config morte + doublons + caveats modèle |
+| Sécurité | ★★★★★ Aucune fuite de secret, OIDC, permissions CI minimales |
 
 ---
 
 ## 2. Architecture
 
-Le paquet `kadi/` s'organise en trois modules métier indépendants,
-orchestrés par des façades de haut niveau.
-
 ```
 kadi/
-├── __init__.py          # Version + logger racine + set_verbosity()
-├── config.py            # Configuration centralisée (CONFIG, URLs, taux)
-├── exceptions.py        # Hiérarchie d'exceptions KadiException
-├── cache.py             # Cache SQLite global
-├── _utils/              # Réseau (retry), coordonnées GPS
-├── _sources/            # Connecteurs bas niveau (Open-Meteo, CHIRPS, SoilGrids)
-│
-├── weather/             # Météo & agronomie (façade : WeatherSession)
-│   ├── data, location, phenology, hydrology, risk
-│
-├── market/              # Économie de marché (façade : Market)
-│   ├── pricing, forecasting, logistics, decision_support
-│   ├── data_ingestion (client WFP), backtesting, _cache, _normalization
-│
-└── kidas/               # Pipeline de données (façade : DataPipeline)
-    ├── cleaner, validator, normalizer, cache, pipeline
-    └── sources/         # csv, excel, json, netcdf, api
+├── __init__.py        # Version, logger racine, set_verbosity()
+├── config.py          # Configuration centralisée (CONFIG, URLs, taux)
+├── exceptions.py      # Hiérarchie KadiException (+ exceptions kidas)
+├── cache.py           # Cache SQLite global
+├── _utils/            # Réseau (retry), coordonnées GPS
+├── _sources/          # Connecteurs bas niveau (Open-Meteo, CHIRPS, SoilGrids)
+├── weather/           # Façade WeatherSession : data, location, phenology,
+│                      #                          hydrology, risk
+├── market/            # Façade Market : pricing, forecasting, logistics,
+│                      #   decision_support, data_ingestion, backtesting
+└── kidas/             # Façade DataPipeline : cleaner, validator, normalizer,
+                       #   cache, sources/{csv,excel,json,netcdf,api}
 ```
 
-**Points forts de l'architecture :**
+**Points forts confirmés :**
 
-- **Pattern façade cohérent** : chaque module expose une classe unique
-  (`WeatherSession`, `Market`, `DataPipeline`) qui masque la complexité
-  des sous-modules. Le point d'entrée est clair pour l'utilisateur final.
-- **Injection de dépendances** : `Market` injecte le `pricing` réel dans
-  `DecisionSupport`, et un `WeatherSession` optionnel dans `MarketLogistics`
-  (intégration météo/logistique « Phase 4 »). Découplage propre et testable.
-- **Initialisation paresseuse** : `WeatherSession._ensure_components()` ne
-  charge les données historiques/prévisions que lorsqu'un composant en a
-  besoin — économie d'appels réseau bienvenue en mode offline-first.
-- **Modules privés préfixés** (`_utils`, `_sources`, `_cache`) : la surface
-  d'API publique est bien délimitée.
+- **Pattern façade** homogène et **injection de dépendances** propre
+  (`Market` injecte `pricing`/`logistics`/`weather_session` dans
+  `DecisionSupport`). Testable et découplé.
+- **Initialisation paresseuse** des composants météo (`_ensure_components`)
+  et des données (`_ensure_data`) : économie d'appels réseau.
+- **Imports conditionnels** bien gérés (ex. NetCDF/xarray optionnel dans
+  `kidas/pipeline.py:25-30`, avec drapeau `_NETCDF_DISPONIBLE`).
+- **Mode dégradé transparent** : drapeau `is_simulated` et `confidence_score`
+  propagés de bout en bout ; l'utilisateur connaît toujours la fiabilité.
+- **Robustesse réseau** : retry + backoff exponentiel, distinction erreurs
+  temporaires (429/5xx) vs permanentes (401/403/404), cascades de fallback
+  (OSRM → Haversine → valeur par défaut).
 
 ---
 
-## 3. Qualité du code
+## 3. Constats détaillés
 
-### Points forts
+Classés par sévérité. Chaque constat indique le fichier, la ligne et l'impact.
 
-- **Documentation exemplaire** : chaque fonction publique dispose d'une
-  docstring structurée (Args / Returns / Raises / Exemples). Rare et
-  précieux. Complétée par des notebooks pédagogiques dans `docs/`.
-- **Validation des entrées** : les façades valident systématiquement types
-  et bornes avant traitement (ex. `_valider_coordonnees`, `_valider_location`
-  dans `market/__init__.py`), évitant les erreurs silencieuses.
-- **Gestion d'erreurs mûre** : hiérarchie d'exceptions dédiée
-  (`KadiException` → `DataSourceError`, `ValidationError`, `KidasReadError`…),
-  avec des sous-classes spécifiques par module.
-- **Robustesse réseau** : retry avec backoff exponentiel
-  (`_utils/network.py`, `data_ingestion._get_with_retry`), distinction
-  correcte entre erreurs temporaires (429/5xx → retry) et permanentes
-  (401/403/404 → échec immédiat).
-- **Mode dégradé transparent** : sans clé API WFP, le système bascule en
-  données simulées avec un drapeau explicite `is_simulated=True` et un
-  `confidence_score` bas. L'utilisateur est toujours informé de la fiabilité.
-- **Propreté** : aucun `except:` nu, aucun `print()` dans le code de
-  bibliothèque (uniquement dans docstrings/README), aucun `TODO/FIXME/HACK`
-  laissé traîner. Logging via `logging.getLogger(__name__)` partout.
-- **Gestion des secrets** : `_charger_token()` lit le token depuis
-  l'environnement puis un `.env`, sans jamais le journaliser — aucune fuite.
+### 🟠 3.1 — Double source de vérité pour les taux de change (config morte)
 
-### Points d'amélioration (mineurs)
+- **Où :** `config.py:212-215` vs `market/_normalization.py:175-178`,
+  utilisé dans `market/pricing.py:19,126,131`.
+- **Constat :** `config.EXCHANGE_RATES` (`XOF_USD = 0.0016`, `XOF_EUR = 0.0015`)
+  **n'est jamais lu** par le code. La normalisation des prix utilise une
+  **autre** table, `EXCHANGE_RATES_DEFAULT` (`USD_TO_XOF = 620.0`,
+  `EUR_TO_XOF = 655.957`), définie dans `_normalization.py`. Le commentaire
+  `pricing.py:18` (« remplacés par config.EXCHANGE_RATES si disponibles »)
+  décrit un mécanisme qui **n'existe pas**.
+- **Impact :** un mainteneur qui met à jour `config.EXCHANGE_RATES` (comme
+  l'invite le commentaire « Mise à jour quotidienne prévue ») croira changer
+  le taux de conversion sans aucun effet réel. Les deux tables emploient en
+  plus des conventions inverses (XOF→USD vs USD→XOF), source de confusion.
+- **Recommandation :** supprimer `config.EXCHANGE_RATES`, **ou** brancher
+  réellement `pricing._EXCHANGE_RATES` dessus. Une seule source de vérité.
 
-1. **Configuration morte** — `config.py:33` définit
-   `MODELS_DIR = .../_ml/models`, mais le dossier `kadi/_ml/` **n'existe pas**
-   et `MODELS_DIR` n'est référencé nulle part ailleurs. À supprimer ou à
-   documenter comme réservé pour une évolution future.
+### 🟠 3.2 — Facteur de consommation carburant ignoré
 
-2. **Incohérence entre boîtes géographiques (GPS bbox)** — trois définitions
-   coexistent :
-   - `config.py` → `weather.gps_validation_bbox` : lat [2.5, 12.5]
-   - `config.py` → `kidas.gps_validation_bbox` : Afrique de l'Ouest élargie
-   - `market/__init__.py:22-25` → constantes **codées en dur** `_LAT_MIN=6.0`…
-     au lieu de lire `CONFIG`.
+- **Où :** `config.py:135` (`consommation_l_per_100km = 12.0`) vs
+  `market/logistics.py:544`.
+- **Constat :** la clé de config `consommation_l_per_100km` **n'est utilisée
+  nulle part**. Le coût carburant est calculé par
+  `d_ab * (gamma_effectif * prix_carburant / 100.0 + mu_checkpoints)`, où le
+  `/ 100.0` codé en dur revient à supposer une consommation d'environ
+  1,2 L/100 km (via `gamma ≈ 1.2`), très loin des 12 L/100 km déclarés.
+- **Impact :** le poste « carburant » du coût de transfert est
+  vraisemblablement **sous-estimé d'un ordre de grandeur (~×10)** si
+  l'intention était bien 12 L/100 km. Cela fausse `calculate_transfer_cost()`
+  et donc les recommandations d'arbitrage spatial.
+- **Recommandation :** clarifier la formule et, soit utiliser
+  `consommation_l_per_100km` (`coût_km = prix * conso / 100`), soit retirer la
+  clé morte et documenter le sens réel de `gamma_route`.
 
-   Le module `market` réimplémente ses propres bornes plutôt que de
-   s'appuyer sur la configuration centralisée. À harmoniser pour éviter
-   qu'un point valide dans un module soit rejeté dans un autre.
+### 🟠 3.3 — Modèle de prévision : hypothèse implicite de données journalières
 
-3. **`requirements.txt` et `pyproject.toml` désynchronisés** —
-   `requirements.txt` déclare `xlrd<2.0` et `dask>=2023.1` **absents** de
-   `pyproject.toml`. Or `pyproject.toml` est la source de vérité pour
-   l'installation via `pip install kadipy`. Résultat : un utilisateur final
-   n'aura ni `xlrd` (lecture `.xls`) ni `dask`. À réconcilier — idéalement
-   supprimer `requirements.txt` au profit du seul `pyproject.toml`, ou le
-   régénérer à partir de celui-ci.
+- **Où :** `market/forecasting.py:78-89` (features) et `:314` (horizon).
+- **Constat :** les harmoniques saisonnières utilisent l'**indice
+  d'observation** `t = 0,1,2,…` comme s'il s'agissait de **jours**
+  (`2π·t/365`, `2π·t/182.5`), et l'horizon futur est
+  `indice = nb_pts - 1 + days_ahead`. Or les prix WFP DataBridges sont
+  typiquement **mensuels** (parfois hebdomadaires), pas journaliers.
+- **Impact :** sur des données non journalières, (a) la période saisonnière
+  est mal calée (365 *observations* ≠ 1 an) et (b) `days_ahead` est ajouté à
+  un index d'observations, si bien que « prévoir à 7 jours » revient à
+  avancer de 7 *pas* (≈ 7 mois si mensuel). La prévision et son intervalle
+  peuvent être significativement biaisés.
+- **Recommandation :** dériver les features du **temps réel** (jour de
+  l'année à partir de la colonne `date`) et convertir `days_ahead` en
+  position temporelle réelle plutôt qu'en nombre d'observations.
 
-4. **`EXCHANGE_RATES` statique** — les taux de change (`config.py:212`) sont
-   codés en dur avec un commentaire « Mise à jour quotidienne prévue » non
-   implémenté. Acceptable en V1, mais à surveiller (les taux XOF/USD dérivent).
+### 🟡 3.4 — Clés de configuration mortes
 
-5. **Volume de `except Exception`** — plusieurs modules capturent
-   `Exception` largement (jusqu'à 6 occurrences dans `data_ingestion.py`,
-   `logistics.py`). C'est cohérent avec la stratégie de repli défensive,
-   mais quelques-uns pourraient cibler des exceptions plus précises pour ne
-   pas masquer de vrais bugs.
+Plusieurs entrées de `config.py` ne sont jamais lues :
+
+| Clé | Ligne | État |
+|---|---|---|
+| `MODELS_DIR` (`_ml/models`) | `config.py:33` | Dossier `kadi/_ml/` **inexistant**, clé non utilisée |
+| `CACHE_DB_BACKUP` | `config.py:20` | Jamais référencée |
+| `EXCHANGE_RATES` | `config.py:212` | Jamais lue (cf. 3.1) |
+| `consommation_l_per_100km` | `config.py:135` | Jamais lue (cf. 3.2) |
+| `min_history_weeks` | `config.py:83` | Jamais lue |
+
+**Recommandation :** supprimer ces clés ou les câbler. Elles laissent croire
+à des comportements configurables qui n'existent pas.
+
+### 🟡 3.5 — Bornes GPS incohérentes entre modules
+
+- **Où :** `market/__init__.py:22-25` code en dur `_LAT_MIN=6.0…` au lieu de
+  lire `CONFIG`, alors que `config.py:66-71` définit
+  `weather.gps_validation_bbox` (lat 2.5–12.5) et `config.py:186-191` une
+  bbox kidas encore différente (Afrique de l'Ouest élargie).
+- **Impact :** un même point peut être **accepté par un module et rejeté par
+  un autre**. Maintenance dispersée.
+- **Recommandation :** centraliser une bbox « Bénin » unique dans `CONFIG` et
+  la réutiliser partout.
+
+### 🟡 3.6 — `requirements.txt` désynchronisé de `pyproject.toml`
+
+- **Où :** `requirements.txt:22,68` déclare `xlrd<2.0` et `dask>=2023.1`,
+  **absents** de `pyproject.toml`.
+- **Impact :** `pip install kadipy` (qui lit `pyproject.toml`) n'installera ni
+  `xlrd` (lecture `.xls`) ni `dask`. Divergence entre l'environnement de dev
+  et l'installation finale.
+- **Recommandation :** faire de `pyproject.toml` la source unique et
+  régénérer / supprimer `requirements.txt`.
+
+### 🟡 3.7 — Détails mineurs
+
+- **`np.random.normal` sans graine** (`pricing.py:70`,
+  `data_ingestion.py:641`) : les prix simulés varient à chaque appel
+  (non reproductible). Impact faible car `is_simulated=True`, mais gêne les
+  tests et la démonstration. → fixer un `seed` ou `np.random.default_rng`.
+- **User-Agent Nominatim obsolète** (`logistics.py:316` : `"KadiPy/0.1.0"`)
+  alors que la version est `1.0.0`. → dériver de `kadi.__version__`.
+- **`EXCHANGE_RATES` statique** avec commentaire « Mise à jour quotidienne
+  prévue » non implémenté (cf. 3.1).
 
 ---
 
 ## 4. Tests et CI
 
-- **238 tests unitaires passent** (12 s) après installation des dépendances.
-  Bonne couverture des trois modules (`test_market/`, `test_kidas/`,
-  `weather/`), incluant des tests de performance et d'intégration mockés.
-- **Tests d'intégration réseau** (`tests/integrations/`, marqueur
-  `integration`) : présents mais non exécutés dans cette analyse (dépendent
-  d'appels externes). Bon réflexe de les isoler via un marqueur pytest.
-- **CI GitHub Actions bien conçue** :
-  - `tests.yml` : matrice Python 3.9 → 3.12, sur push et PR.
-  - `publish.yml` : publication PyPI via **Trusted Publishing (OIDC)**,
-    sans secret stocké — excellente pratique de sécurité.
-  - `docs.yml` : publication MkDocs + `mike` (versionnage de doc).
-  - Les permissions des workflows sont restreintes au minimum
-    (`contents: read`), suite au correctif de scan de code (alerte #1).
-
-**Suggestion :** ajouter une mesure de couverture (`pytest-cov`) au workflow
-`tests.yml` pour suivre l'évolution dans le temps.
+- **238 tests unitaires passent** (couverture des 3 modules, incluant
+  performance et intégration mockée).
+- **Tests d'intégration réseau** isolés via le marqueur `integration`
+  (`pytest.ini`) — bonne pratique ; non exécutés hors ligne.
+- **CI GitHub Actions solide** :
+  - `tests.yml` : matrice Python 3.9→3.12 sur push/PR.
+  - `publish.yml` : **PyPI via Trusted Publishing (OIDC)**, sans secret stocké.
+  - `docs.yml` : MkDocs + `mike` (doc versionnée).
+  - Permissions restreintes (`contents: read`).
+- **Suggestions :** ajouter `pytest-cov` au workflow pour suivre la
+  couverture ; ajouter un test de non-régression sur la formule de coût
+  carburant (§3.2) une fois clarifiée.
 
 ---
 
 ## 5. Sécurité
 
-Aucun problème de sécurité identifié :
+Aucun problème identifié :
 
-- Pas de secret en dur ; le token WFP est lu depuis l'environnement/`.env`
-  et **jamais journalisé**.
-- Publication PyPI en OIDC (pas de token PyPI stocké).
-- Pas d'exécution dynamique (`eval`/`exec`), pas de désérialisation non sûre
-  exposée à des entrées externes.
+- Token WFP lu depuis l'environnement/`.env` et **jamais journalisé**
+  (`data_ingestion.py:221-257`).
+- Publication PyPI en OIDC (aucun token stocké).
+- Pas d'`eval`/`exec`, pas de désérialisation non sûre.
+- Aucun `except:` nu, aucun `print()` en bibliothèque, aucun `TODO/FIXME`.
 - Permissions CI minimales.
 
 ---
 
 ## 6. Recommandations priorisées
 
-| Priorité | Action | Effort |
-|---|---|---|
-| 🔴 Haute | Réconcilier `requirements.txt` ↔ `pyproject.toml` (xlrd, dask) | Faible |
-| 🟠 Moyenne | Supprimer `MODELS_DIR`/`_ml` mort ou créer le dossier | Faible |
-| 🟠 Moyenne | Centraliser les bornes GPS de `market` dans `CONFIG` | Faible |
-| 🟡 Basse | Ajouter `pytest-cov` à la CI | Faible |
-| 🟡 Basse | Rendre `EXCHANGE_RATES` configurable / dynamique | Moyen |
-| 🟡 Basse | Cibler certaines `except Exception` trop larges | Moyen |
+| Priorité | Action | Réf. | Effort |
+|---|---|---|---|
+| 🟠 Haute | Unifier la source des taux de change (supprimer ou câbler `config.EXCHANGE_RATES`) | 3.1 | Faible |
+| 🟠 Haute | Clarifier / corriger la formule de coût carburant (facteur conso) | 3.2 | Faible |
+| 🟠 Haute | Baser les features de prévision sur le temps réel, pas l'index d'obs. | 3.3 | Moyen |
+| 🟡 Moyenne | Supprimer les clés de config mortes | 3.4 | Faible |
+| 🟡 Moyenne | Centraliser la bbox GPS « Bénin » dans `CONFIG` | 3.5 | Faible |
+| 🟡 Moyenne | Réconcilier `requirements.txt` ↔ `pyproject.toml` | 3.6 | Faible |
+| 🟡 Basse | Graine RNG, User-Agent versionné, `pytest-cov` | 3.7, §4 | Faible |
 
 ---
 
 ## 7. Conclusion
 
-KadiPy est un projet **bien conçu, bien documenté et bien testé**, avec une
-architecture claire et des choix d'ingénierie solides (façades, injection de
-dépendances, mode offline-first, CI OIDC). La dette technique est faible et
-concerne surtout des incohérences de configuration sans impact fonctionnel
-majeur. Le traitement des cinq recommandations ci-dessus renforcerait la
-maintenabilité sans remettre en cause l'existant.
+KadiPy reste un projet **bien conçu, bien documenté et bien testé**, sans bug
+bloquant. Cette analyse approfondie confirme la qualité de l'architecture,
+mais identifie un **noyau de dette de configuration et deux points de
+modélisation** (taux de change fantômes, coût carburant sous-modélisé,
+saisonnalité indexée sur les observations) qui méritent correction : ils
+touchent directement la justesse des coûts logistiques et des prévisions de
+prix, c'est-à-dire le cœur de la valeur métier du module `market`. Le
+traitement des trois recommandations « Haute » ci-dessus fiabiliserait les
+résultats sans remettre en cause l'existant.
